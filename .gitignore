@@ -1,0 +1,6 @@
+.work/
+out/
+kernel-build.log
+__pycache__/
+*.pyc
+pack-output/

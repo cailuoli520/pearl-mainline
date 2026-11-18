@@ -1,13 +1,13 @@
 # pearl-mainline
 
-Redmi Note 12T Pro (pearl)：boot / vendor_boot 打包指南
+Redmi Note 12T Pro (pearl)：Actions 内核构建与 boot / vendor_boot 打包指南
 
-本文聚焦 **boot、vendor_boot 的封装、原厂 DTBO、三个 vbmeta 禁用校验，以及试错雷点与正确方法**。桌面、容器和 rootfs 制作流程留在历史资料中，本页不展开。
+本仓库提供 **Ubuntu 26 ARM64 自动内核/模块构建与 Release 发布**，并保留 **boot、vendor_boot 的封装、原厂 DTBO、三个 vbmeta 标志处理和试错记录**。rootfs 制作与设备刷写不由内核 CI 自动执行。
 
 当前正确组合：
 
 ```text
-最新 Pearl 专用分支源码 + 指定归档 config → 本次 gzip kernel
+最新 Pearl 专用分支源码 + 本仓库 configs/pearl.config → 本次 gzip kernel
 boot v4        = kernel + Linux initramfs
 vendor_boot v4 = 同包原厂模板 + 同一份 Linux initramfs + 原厂完整 DT_TABLE
 DTBO           = 原厂完整镜像，保持原样
@@ -16,47 +16,57 @@ DTBO           = 原厂完整镜像，保持原样
 
 **证据边界：**既有 7.2.10++ 组合已有实机启动和运行记录；最新源码的新构建、以及新生成的三份 vbmeta 禁用副本，分别记录构建和实机验收结果，继承旧记录不等于完成新组合验收。
 
-## 1. 内核：指定 config，源码取最新 Pearl HEAD
+## 1. Actions：本仓库配置 + 最新 Pearl 源码 + Ubuntu 默认 clang
 
-配置固定从[指定归档 config](https://github.com/Magma-71453/redmi-note-12t-pro-archlinuxarm/blob/main/artifacts/kernel-7.2.10%2B%2B/config)获取；`7.2.10++` 是已有产物的 release 标签，不是要求复用旧 Image.gz。
+进入 [Actions → Build Pearl kernel and release](https://github.com/cailuoli520/pearl-mainline/actions/workflows/build-kernel.yml)，点击 **Run workflow**。修改并提交 [configs/pearl.config](configs/pearl.config)、工作流或构建脚本到 `main` 也会自动构建。
 
-源码使用 [MT6895-Mainline/linux 的 Pearl 分支](https://github.com/MT6895-Mainline/linux/tree/7.2-mt6895-xiaomi-pearl)。**显式选择 Pearl**：上游默认分支属于 Xaga。
+| 项目 | 固定规则 |
+|---|---|
+| Runner | GitHub 托管 `ubuntu-26.04-arm`，原生 ARM64，不使用本机 WSL 或旧自托管编译机 |
+| 编译器 | `apt install clang llvm lld`，使用 Ubuntu 默认无版本命令；不锁定 Clang 版本、不下载外部 LLVM、不手动切 alternatives |
+| 内核源码 | 每次重新 `git clone` [Pearl 专用分支](https://github.com/MT6895-Mainline/linux/tree/7.2-mt6895-xiaomi-pearl)的最新 HEAD；不固定内核 commit，也不使用上游默认 Xaga 分支 |
+| 配置入口 | 仅本仓库 [configs/pearl.config](configs/pearl.config)，未来直接修改此文件即可 |
+| 初始来源 | Magma 配置一次性导入；来源与初次转换记录见 [magma-import.json](configs/magma-import.json)，运行时不再拉取 Magma 配置 |
+| 源码补丁 | 额外 Magma 补丁为 0；用独立 in-tree 工作目录构建，不改写上游源码 |
+| 并发 | `-j4`，同一主分支的工作流串行排队，不混用输出目录 |
+| 发布 | 编译与打包成功后直接由 `gh release create` 自动发布；任一步出错立即停止 |
 
-截至 **2026-11-16**，Pearl 分支最新 HEAD 为 [904c3ce0833daf168911dffa30e7957fad3b0315](https://github.com/MT6895-Mainline/linux/commit/904c3ce0833daf168911dffa30e7957fad3b0315)，[Makefile](https://github.com/MT6895-Mainline/linux/blob/904c3ce0833daf168911dffa30e7957fad3b0315/Makefile#L1-L6) 基础版本仍是 **7.2.10**，比历史构建源码 a908b7825c7d619873392e5fbbcba2e54695d0eb 前进 6 个提交。这里的“最新”指**执行构建时该兼容分支的最新源码**，不是通用 Linux 主线或其他机型分支。
+### 统一版本与同次模块
 
-从仓库根目录开始，使用新源码目录：
+版本只保留 **基础版本 + 内核 commit 前 12 位**，例如：
 
-```bash
-set -euo pipefail
-KSRC="$PWD/build/linux-mt6895-latest"
-KERNEL_REPO='https://github.com/MT6895-Mainline/linux.git'
-KERNEL_BRANCH='7.2-mt6895-xiaomi-pearl'
-CONFIG_URL='https://raw.githubusercontent.com/Magma-71453/redmi-note-12t-pro-archlinuxarm/main/artifacts/kernel-7.2.10%2B%2B/config'
-
-test ! -e "$KSRC"
-mkdir -p build
-git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" \
-  "$KERNEL_REPO" "$KSRC"
-curl --fail --location --retry 3 "$CONFIG_URL" -o "$KSRC/.config"
-cp "$KSRC/.config" "$KSRC/.config.input"
-
-# 将指定配置迁移至当前源码；新选项由 olddefconfig 补齐。
-make -C "$KSRC" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-  CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-
-# 沿用项目补丁时，先在这份最新源码上执行 git apply --check。
-# 本页只描述内核输入；补丁是否应用、工具链版本均写入本次构建记录。
-make -C "$KSRC" -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-  CROSS_COMPILE=aarch64-linux-gnu- Image.gz dtbs modules
-
-git -C "$KSRC" rev-parse HEAD
-make -s -C "$KSRC" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-  CROSS_COMPILE=aarch64-linux-gnu- kernelrelease
-sha256sum "$KSRC/.config.input" "$KSRC/.config" \
-  "$KSRC/arch/arm64/boot/Image.gz"
+```text
+uname -r:       7.2.10-904c3ce0833d
+模块目录:       /lib/modules/7.2.10-904c3ce0833d
+模块归档:       modules-7.2.10-904c3ce0833d.tar.zst
 ```
 
-输入配置包含 `CONFIG_LOCALVERSION="+"`、48-bit VA/PA、MTU3 双角色和 Panthor 等设置；最终 release 以实际 `make kernelrelease` 为准。源码/补丁变化后，使用同次构建的模块；历史压缩尺寸和 SHA-256 只用于辨认旧样本，**不作为新内核的验收门槛**。
+CI 在临时 `.config` 设置对应 `CONFIG_LOCALVERSION`，关闭 `CONFIG_LOCALVERSION_AUTO`，每次 `make` 显式传入 `LOCALVERSION=`，避免旧 `++`。本仓库配置不被这一步覆盖。工具链、配置变化后即使版本字符串相同，也应使用**同一个 Release 的 Image 和模块整套产物**；同名本身不是 ABI 相容性证明。
+
+### 自动发布内容
+
+- `Image`、`Image.gz`、`pearl.dtb`
+- 同次 `modules-<release>.tar.zst`
+- `kernel.config`、`kernel.release`、`System.map`、`Module.symvers`
+- `build-info.txt`：完整内核 commit、版本、配置来源和实际编译器版本
+
+脚本以 `set -euo pipefail` 直接执行构建和打包，任一步失败立即停止并保存日志。不额外逐模块解析、二次解压或远端摘要复核。
+
+此 Actions 流程发布内核、DTB、模块；boot/vendor_boot 和 rootfs 不混入这次内核发布。后续手工封装仍沿用以下已验证 OEM 模板配方；CI 通过不代表完成实体屏幕、无线、音频等实机验收。
+
+### 原生 Ubuntu ARM64 复现
+
+在新的工作树中使用 Ubuntu 默认工具与本仓库脚本，不用 Windows WSL：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y clang llvm lld make bc bison flex gawk pkg-config pahole \
+  libssl-dev libelf-dev zlib1g-dev openssl git python3 xz-utils zstd kmod rsync file gzip cpio
+BUILD_JOBS=4 bash scripts/build-kernel.sh
+# 完整产物在 out/；后续封装使用 out/Image.gz。
+```
+
+初次导入仍保留 48-bit VA/PA、MTU3 双角色、Panthor 等板级配置。具体配置以本仓库文件及此次 `olddefconfig` 后发布的 `kernel.config` 为准，历史尺寸和 SHA256 仅用于辨认旧样本，不锁定新构建。
 
 ## 2. 原厂输入与已验证的结构
 
@@ -99,9 +109,9 @@ curl --fail --location \
   | base64 --decode > downloads/avbtool.py
 AVB_TOOL="$PWD/downloads/avbtool.py"
 STOCK="$PWD/stock"
-KERNEL="$KSRC/arch/arm64/boot/Image.gz"
+KERNEL="${KERNEL:-$PWD/out/Image.gz}"
 RAMDISK="$PWD/linux/initramfs-final.cpio.lz4"
-OUT="$PWD/out/pearl-pack-$(date +%Y%m%d-%H%M%S)"
+OUT="$PWD/pack-output/pearl-pack-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT/template" "$OUT/verify"
 
 gzip -t "$KERNEL"
@@ -264,11 +274,11 @@ stat -c '%n %s' "$OUT/boot.img" "$OUT/vendor_boot.img" "$OUT/dtbo-stock.img"
 
 ## 9. 来源与版本记录
 
-- [指定 config](https://github.com/Magma-71453/redmi-note-12t-pro-archlinuxarm/blob/main/artifacts/kernel-7.2.10%2B%2B/config)：本次核验 git blob 为 3e9417ad3335bad115e6f65c62211e6aeb8beacd；编译前重新下载并记录实际 hash。
+- [本仓库构建配置](configs/pearl.config)与[一次性 Magma 导入记录](configs/magma-import.json)：初始 Git blob 为 `3e9417ad3335bad115e6f65c62211e6aeb8beacd`；后续只读本仓库配置，不从 Magma 重新下载覆盖。
 - [Pearl 专用源码分支](https://github.com/MT6895-Mainline/linux/tree/7.2-mt6895-xiaomi-pearl)与[历史源码到当前 HEAD 的比较](https://github.com/MT6895-Mainline/linux/compare/a908b7825c7d619873392e5fbbcba2e54695d0eb...904c3ce0833daf168911dffa30e7957fad3b0315)。
 - [既有内核来源与运行记录](https://github.com/Magma-71453/redmi-note-12t-pro-archlinuxarm/blob/5afcd01c0e649a32f71f2413cb7823271911aedc/docs/kernel-provenance.md)：历史构建、补丁与实测基线，区别于最新 HEAD 的新构建。
 - [AOSP mkbootimg](https://android.googlesource.com/platform/system/tools/mkbootimg/)与[AOSP AVB](https://android.googlesource.com/platform/external/avb/)：头部、descriptor、禁用位及工具实现依据。
 
-本页更新的是打包文案与可复现命令，未执行本轮最新内核编译或设备刷写。原厂文件留作输入，生成结果写入新的输出目录；现场槽位状态与原厂 DTBO 内容单独核对。
+内核编译和发布结果以 [Actions 运行记录](https://github.com/cailuoli520/pearl-mainline/actions/workflows/build-kernel.yml)及每个 Release 的 `build-info.txt` 为准。CI 不执行设备刷写；手工封装的原厂文件留作输入，生成结果写入独立目录，现场槽位状态与原厂 DTBO 内容单独核对。
 
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)

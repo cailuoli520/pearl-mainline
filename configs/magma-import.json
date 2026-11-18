@@ -1,0 +1,12 @@
+{
+  "SourceRepository": "Magma-71453/redmi-note-12t-pro-archlinuxarm",
+  "SourceCommit": "5afcd01c0e649a32f71f2413cb7823271911aedc",
+  "SourcePath": "artifacts/kernel-7.2.10++/config",
+  "SourceGitBlob": "3e9417ad3335bad115e6f65c62211e6aeb8beacd",
+  "SourceBytes": 333104,
+  "SourceSha256": "870afb391e9eb1bf4eb19cda7fe1485b59a0478ebebc95e6e11d9541f2050508",
+  "RepositoryFile": "configs/pearl.config",
+  "RepositorySha256": "f7db3408de0577e07777caf340c00a74b2cd60522c3791468311f102f69a0719",
+  "Normalization": "Only CONFIG_LOCALVERSION changed from + to empty; CI owns version-commit suffix",
+  "RuntimeMagmaDownload": false
+}

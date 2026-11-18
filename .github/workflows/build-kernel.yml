@@ -1,0 +1,72 @@
+name: Build Pearl kernel and release
+run-name: Pearl kernel · build ${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-kernel.yml'
+      - 'configs/**'
+      - 'scripts/**'
+      - '.gitattributes'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pearl-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 360
+    env:
+      BUILD_JOBS: '4'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Ubuntu default clang and build dependencies
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            clang llvm lld make bc bison flex gawk pkg-config pahole \
+            libssl-dev libelf-dev zlib1g-dev openssl git python3 \
+            xz-utils zstd kmod rsync file gzip cpio
+
+      - name: Build latest Pearl kernel and same-build modules
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/build-kernel.sh 2>&1 | tee kernel-build.log
+
+      - name: Upload compiled artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: pearl-kernel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish Release after successful build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_RELEASE: ${{ steps.build.outputs.kernel_release }}
+        run: |
+          gh release create "${KERNEL_RELEASE}-build-${GITHUB_RUN_NUMBER}-a${GITHUB_RUN_ATTEMPT}" \
+            out/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$KERNEL_RELEASE" --notes-file out/build-info.txt
+
+      - name: Preserve build log
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: pearl-build-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: kernel-build.log
+          if-no-files-found: ignore
+          retention-days: 14
