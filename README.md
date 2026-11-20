@@ -102,6 +102,14 @@ Android 版本、补丁日期、地址、盐和分区容量从对应 stock 模�
 
 本仓库当前自动流程只负责内核、DTB 和模块，rootfs 独立制作并放入设备根分区。
 
+### Pearl rootfs skill
+
+[pearl-rootfs](.agents/skills/pearl-rootfs/SKILL.md) 已整理原生 ARM64 编译机的 KDE Plasma Mobile 配方、中文/账户/镜像设置，以及双 USB ACM 日志和命令登录通道。它省略耗时的 Okular 手机前端源码构建与额外验收，使用同一 Release 的内核和模块。
+
+在 DSH 中以本仓库为工作目录时，默认项目技能目录 `.agents/skills` 可发现 `pearl-rootfs`；调用后按需读取配方和源码资源。该 skill 是手工构建方法，不会单独触发内核 Actions，也没有安装或修改全局 Agent preset。
+
+USB 方案会编译新的小型 CINIT/helper，并以既有 ramdisk 作为固件/CPIO 基础重新封装；启动失败保留救援，成功后接续 rootfs 的普通账户登录。完整说明与资源见 [skill 目录](.agents/skills/pearl-rootfs)。
+
 既有 Arch Linux ARM、Omarchy Mobile 和 Nura + Phosh 的尝试、完成情况与遗留问题，见 [项目历程](hittory.md)。历史系统跑通的功能不自动算作新内核、新 rootfs 的实机结果。
 
 ---
