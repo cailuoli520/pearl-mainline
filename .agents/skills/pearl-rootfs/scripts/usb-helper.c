@@ -35,6 +35,8 @@ static bool early, rescue, bound, configured, setup_finished, configured_once;
 static int disk_fd = -1, kmsg_fd = -1, journal_fd = -1, log_fd = -1;
 static int lock_fd = -1;
 static pid_t getty_pid, journal_pid;
+static uint64_t getty_started;
+static int getty_fast_exits;
 static const char *busybox = "/bin/busybox", *agetty = "/usr/bin/agetty";
 static const char *rescue_shell = "/usr/lib/pearl-usb/sh";
 static char udc[128], log_tty[64], shell_tty[64], shell_name[32], pid_path[128];
@@ -145,13 +147,13 @@ static int attr_write(const char *path, const char *value)
 
 static int make_link(const char *target, const char *path)
 {
+    /* configfs resolves symname with kern_path at syscall time, relative to cwd.
+     * Always pass an absolute target; readlink text is normalized by configfs. */
     if (symlink(target, path) == 0) return 0;
     if (errno != EEXIST) return -1;
-    char actual[256];
-    ssize_t n = readlink(path, actual, sizeof(actual) - 1);
-    if (n < 0) return -1;
-    actual[n] = 0;
-    if (!strcmp(actual, target)) return 0;
+    struct stat actual, wanted;
+    if (stat(path, &actual) || stat(target, &wanted)) return -1;
+    if (actual.st_dev == wanted.st_dev && actual.st_ino == wanted.st_ino) return 0;
     errno = EEXIST;
     return -1;
 }
@@ -175,8 +177,11 @@ static void drain_kmsg(void)
 /* Only touch another gadget if it is actually bound to the chosen UDC; once. */
 static int release_udc_owner(void)
 {
+    static bool attempted;
+    if (attempted) return 0;
     DIR *dir = opendir(GROOT);
     if (!dir) return -1;
+    attempted = true;
     struct dirent *entry;
     int rc = 0;
     while ((entry = readdir(dir))) {
@@ -268,8 +273,8 @@ static int prepare_gadget(void)
     ATTRIBUTE("/configs/c.1/strings/0x409/configuration", "Logs + Console\n");
     DIRECTORY("/functions/acm.log");
     DIRECTORY("/functions/acm.shell");
-    if (make_link("../../functions/acm.log", GADGET "/configs/c.1/acm.log") ||
-        make_link("../../functions/acm.shell", GADGET "/configs/c.1/acm.shell")) return -1;
+    if (make_link(GADGET "/functions/acm.log", GADGET "/configs/c.1/acm.log") ||
+        make_link(GADGET "/functions/acm.shell", GADGET "/configs/c.1/acm.shell")) return -1;
 #undef DIRECTORY
 #undef ATTRIBUTE
     if (read_ports() || release_udc_owner()) return -1;
@@ -281,17 +286,24 @@ static int prepare_gadget(void)
 
 static void setup_tick(uint64_t now)
 {
+    static bool warned;
+    static int last_error;
     if (setup_finished || stopping || now < next_setup) return;
-    if (now >= setup_deadline) {
+    if (now >= setup_deadline && !warned) {
+        warned = true;
+        note("[pearl-usb] UDC/gadget not ready after 8s; retrying asynchronously, PID1 remains unblocked\n");
+    }
+    next_setup = now + 1000;
+    if (choose_udc()) return;
+    if (!prepare_gadget()) {
         setup_finished = true;
-        note("[pearl-usb] UDC/gadget setup deadline (8s); continuing disk logging without blocking PID1\n");
         return;
     }
-    next_setup = now + 100;
-    if (choose_udc()) return;
-    /* Configfs creation and the single unbind/bind attempt are never retried in a tug-of-war. */
-    setup_finished = true;
-    if (prepare_gadget()) note("[pearl-usb] gadget setup failed: %s; disk logging remains active\n", strerror(errno));
+    int error = errno;
+    if (error != last_error) {
+        last_error = error;
+        note("[pearl-usb] gadget setup failed: %s; retrying own gadget without repeated owner release\n", strerror(error));
+    }
 }
 
 static void save_pids(void)
@@ -323,16 +335,22 @@ static void start_getty(uint64_t now)
     pid_t pid = fork();
     if (pid == 0) {
         child_signals();
+        /* "-L" is the argument-free form: agetty in this image rejects
+         * --local-line=<mode> and exits before printing the login prompt. */
         if (early || rescue)
             execl(busybox, busybox, "getty", "-L", "-n", "-l", early ? "/bin/sh" : rescue_shell,
                   "115200", shell_name, "vt100", (char *)NULL);
-        else
-            execl(agetty, agetty, "--local-line=always", "--noclear", shell_name,
+        else if (getty_fast_exits < 3)
+            execl(agetty, agetty, "-L", "--noclear", shell_name,
                   "115200", "vt100", (char *)NULL);
+        else
+            execl(busybox, busybox, "getty", "-L", "-n", "-l", "/bin/login",
+                  "115200", shell_name, "vt100", (char *)NULL);
         _exit(127);
     }
     if (pid < 0) { note("[pearl-usb] getty fork failed: %s\n", strerror(errno)); return; }
     getty_pid = pid;
+    getty_started = now;
     save_pids();
     note("[pearl-usb] %s getty pid=%ld on %s; exits respawn after 1s\n",
          early || rescue ? "BusyBox rescue" : "account-login agetty", (long)pid, shell_tty);
@@ -385,9 +403,18 @@ static void reap_children(void)
     pid_t pid;
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         if (pid == getty_pid) {
-            note("[pearl-usb] getty pid=%ld exited status=%d\n", (long)pid, status);
+            uint64_t now = now_ms();
+            if (now - getty_started < 2000) {
+                if (getty_fast_exits < 100) ++getty_fast_exits;
+                if (getty_fast_exits == 3)
+                    note("[pearl-usb] agetty keeps exiting fast; switching to BusyBox getty login\n");
+            } else {
+                getty_fast_exits = 0;
+            }
+            note("[pearl-usb] getty pid=%ld exited status=%d after %llums\n",
+                 (long)pid, status, (unsigned long long)(now - getty_started));
             getty_pid = 0;
-            next_getty = now_ms() + 1000;
+            next_getty = now + 1000;
         }
         if (pid == journal_pid) {
             drain_journal();

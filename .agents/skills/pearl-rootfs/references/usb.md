@@ -43,7 +43,8 @@ helper 建一个 configfs gadget：`acm.log` 与 `acm.shell`，CDC composite `EF
 
 - early：非阻塞读取 `/dev/kmsg`，保存 `/pearl-early.log`，日志口有 256 KiB 有界缓冲、CRLF 与迟连接回放；命令口是启动阶段的静态救援 shell。
 - root：持续读取本次 journal，保存 `/var/log/pearl-usb/boot.log`；命令口用 agetty，登录普通账户 `mobian`。
-- UDC 发现最多等 8 秒；采用已经注册的控制器，只解除实际占用该 UDC 的旧 gadget 一次，保持 USB role 原配置。PC 未连接不会阻塞 PID1 引导。
+- UDC 发现的 8 秒是软提示，之后每秒继续后台重试；采用已经注册的控制器，只解除实际占用该 UDC 的旧 gadget 一次，保持 USB role 原配置。PC 未连接不会阻塞 PID1 引导。
+- configfs 在创建链接时按进程当前目录解析目标，helper 应传入 function 的绝对路径；已有链接按实际目标 inode 判断，而不是比较 `readlink` 的文本。
 
 这是 Linux gadget 就绪后的 USB 通道，不是 LK/BootROM 的硬件 UART。开启前已被有限 kmsg 缓冲覆盖的文字由其他早期日志来源处理；不要把它写成所有启动阶段均已抓到。
 
@@ -77,16 +78,25 @@ WantedBy=multi-user.target
   --rescue-shell /usr/lib/pearl-usb/sh
 ```
 
-## 5. CINIT 行为
+## 5. 登录 getty 参数
+
+登录口用 `agetty -L --noclear ttyGS1 115200 vt100`。**必须用无参数的 `-L`**，不要写 `--local-line=always`：这个镜像里的 agetty（util-linux 2.42.4）会回 `--local-line 选项参数无效` 并立即退出，日志里表现为每秒 `account-login agetty getty pid=… on /dev/ttyGS1` 紧跟 `getty pid=… exited status=256`，登录口永远没有 `login:` 提示符，而日志口一切正常。
+
+helper 会记录 getty 存活时间；连续三次不到 2 秒就退出时打印 `agetty keeps exiting fast` 并改用 BusyBox getty + `/bin/login` 兜底，保证登录口不会因为 agetty 参数/版本问题彻底不可用。
+
+## 6. CINIT 行为
 
 资源补丁把 AArch64 getdents64 从旧 217 修为 61，PID1 用 `clone(SIGCHLD)` 启动独立 helper，继续挂载根分区（60×500ms 重试）。重要阶段打印成功/errno，挂载耗尽则留下 early 救援。
 
+无 libc 的 CINIT 使用 AArch64 文件打开常量：`O_DIRECTORY=0x4000`、`O_NOFOLLOW=0x8000`、`O_CLOEXEC=0x80000`。`0x10000` 在这个架构上是 `O_DIRECT`，用于打开目录会返回 `EINVAL`（22）；与 x86 的同名常量分开处理。对已打过 USB 补丁的源码，生成脚本也会修正旧常量并保存原副本。
+
 成功切根前使用 subreaper/PPid 子树处理 getty 的 setsid 子进程，有界 TERM/KILL 清理。保存早期日志到 `/newroot/var/log/pearl-usb/initramfs.log`，移动 sys/dev 时连同 configfs/devpts 保留。检查实际切根调用返回值；最终 systemd 仍由原 PID1 exec，失败留救援而不是静默 sleep。
+
+清理必须是尽力而为：真机上 helper 的子进程可能既杀不掉也回收不了，若因此中止切根，桌面就永远起不来。判断存活要用 `/proc/<pid>` 是否存在，不能用 `kill(pid,0)`——未回收的僵尸仍会应答 0，会让循环误以为进程还活着。TERM、KILL 各自 20×100ms 有界扫描后，对剩余项只打印 `pid` 与 `/comm` 再继续切根，不再有 abort 分支。
 
 以上返回值处理属于正常引导错误处理，不是额外镜像验收。
 
 ## 6. boot/vendor_boot 打包
-
 将新 `/init`、helper、BusyBox 与链接覆盖到现有 Pearl newc 载荷目录，正常生成 newc 后以 legacy LZ4 压缩；boot 与 vendor_boot 使用同一份新 ramdisk。
 
 用 AOSP `unpack_bootimg --format mkbootimg` 导出 stock 参数：boot 替换本次 Image.gz 与 ramdisk，vendor_boot 仅替换 vendor ramdisk fragment。保留 OEM 的完整 DTB 容器、地址、cmdline、bootconfig 和真实 ramdisk 表。
@@ -94,3 +104,17 @@ WantedBy=multi-user.target
 使用 AOSP `avbtool add_hash_footer --algorithm NONE` 完成 Linux 镜像封装；盐、props、rollback、容量来自对应 stock 的实际元数据。stock 原件保持原样，输出是本次 artifacts 里的新文件。
 
 省略输出二次 unpack、CRC/hash 对比、ELF 扫描、硬件 fixture 等验收。正常打包命令报错就停止；用户当前请求只要成品时，不自动刷手机。
+
+## 7. /tmp 执行行为
+
+配置优先级遵从当前任务的实际编译机：已有对应配置或默认行为时按编译机，缺项才沿用上游；必要的 Pearl 板级差异保持最小并记录。
+
+上游 CINIT 为根文件系统的 `/tmp` 设置了 `MS_NOSUID | MS_NOEXEC`。当前编译机的临时目录允许执行映射，因此本补丁仅去掉该 `/tmp` 挂载的 `MS_NOEXEC`，保留 `MS_NOSUID`；`/proc`、`/sys` 和 devpts 的设置保持原样；`/run` 的后续对齐见下节。已有 USB 补丁源码也会修正此处并保存 `init.c.before-tmp-exec`。
+
+旧 boot 尚在使用时，可用一次性开机服务 `pearl-tmp-exec.service` 执行 `mount -o remount,exec,nosuid /tmp`，保持标准 `1777` 权限。该服务只修正临时目录行为，不常驻、不重编 Node 或 DSH。新生成的 CINIT 本身已允许 `/tmp` 加载原生 `.node` 模块。
+
+## 8. /run 执行行为
+
+当前编译机的 `/run` 为 `0755` 且允许执行映射。手机保留运行时 `tmpfs` 与 `MS_NOSUID`，仅去掉 CINIT 中 `/run` 的 `MS_NOEXEC`；权限保持 `0755`，不复制编译机容器的 overlay 路径。已有 USB 补丁源码会同步修正并保存 `init.c.before-run-exec`。
+
+旧 boot 尚在使用时，开机一次性服务 `pearl-run-exec.service` 执行 `mount -o remount,exec,nosuid /run` 和 `chmod 0755 /run`。此项只对齐 `/run` 的执行行为，其他挂载选项保持原样。

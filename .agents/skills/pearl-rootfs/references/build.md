@@ -45,6 +45,7 @@ https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/$arch/$repo
 - locale.conf：`LANG=zh_CN.UTF-8`、`LANGUAGE=zh_CN:zh`。
 - localtime：`../usr/share/zoneinfo/Asia/Shanghai`。
 - KDE 的 kdeglobals/plasma-localerc 写中文设置；mobian 的 home、`.config` 和用户资源由该用户拥有。
+- 显示倍率由 KWin/Wayland 输出配置负责；`/etc/environment` 保留语言和输入法设置即可。全局 `QT_SCALE_FACTOR=2` 会额外放大 Qt 界面，应让 Qt 跟随合成器输出倍率。
 - root 标记：`/etc/mt6895-rootfs`。
 - ext4 label：`kdepearl`；fstab：`LABEL=kdepearl / ext4 defaults,noatime 0 1`。
 

@@ -4,16 +4,156 @@ from pathlib import Path
 import sys
 
 SOURCE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "inputs/cinit-source/init.c"
+
+# The handoff must never depend on being able to kill the early USB helper: on
+# real hardware a child can stay unreapable, and aborting there costs the desktop.
+NEW_HANDOFF = r'''/* A PID that still answers kill(pid,0) may merely be an unreaped zombie, so the
+ * authoritative question is whether /proc/<pid> still exists. */
+static int pid_present(long pid)
+{
+    char path[64], value[24];
+    long fd;
+    number_(value, pid);
+    concat(path, "/proc/", value, sizeof(path));
+    fd = openat(AT_FDCWD, path, O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0) return 0;
+    close_(fd);
+    return 1;
+}
+
+static int live_pids(int count)
+{
+    int i, live = 0;
+    for (i = 0; i < count; ++i) if (pid_present(g_stop_pids[i])) ++live;
+    return live;
+}
+
+/* Log every survivor by pid and comm so the next iteration has real names. */
+static int log_survivors(int count)
+{
+    int i, live = 0;
+    for (i = 0; i < count; ++i) {
+        char path[64], value[24], record[128], message[224];
+        long fd, n, pid = g_stop_pids[i];
+        if (!pid_present(pid)) continue;
+        ++live;
+        number_(value, pid);
+        concat(path, "/proc/", value, sizeof(path));
+        concat(path, path, "/comm", sizeof(path));
+        record[0] = 0;
+        fd = openat(AT_FDCWD, path, O_RDONLY, 0);
+        if (fd >= 0) {
+            n = read_(fd, record, sizeof(record) - 1);
+            close_(fd);
+            if (n > 0) {
+                record[n] = 0;
+                while (n > 0 && (record[n - 1] == '\n' || record[n - 1] == '\r')) record[--n] = 0;
+            } else {
+                record[0] = 0;
+            }
+        }
+        concat(message, "CINIT: early child survived pid=", value, sizeof(message));
+        concat(message, message, " comm=", sizeof(message));
+        concat(message, message, record[0] ? record : "?", sizeof(message));
+        concat(message, message, "\n", sizeof(message));
+        kmsg(message);
+    }
+    return live;
+}
+
+/* Best effort only. A stray helper must never cost the desktop: after the
+ * bounded TERM/KILL sweeps the handoff continues and the real init owns the box. */
+static int stop_early_usb(void)
+{
+    int i, j, count, live;
+    long helper = g_usb_pid;
+    kmsg("CINIT: stopping early USB helper and all setsid descendants\n");
+    sleep_ms(100); /* final boot records can be drained, independent of host attachment */
+    count = remember_pids(0);
+    if (helper > 1) { kill_(helper, 15); kill_(-helper, 15); }
+    for (i = 0; i < 20; ++i) {
+        reap_usb();
+        count = remember_pids(count);
+        if (!live_pids(count)) break;
+        sleep_ms(100);
+    }
+    for (i = 0; i < 20; ++i) {
+        reap_usb();
+        count = remember_pids(count);
+        live = live_pids(count);
+        if (!live) break;
+        for (j = 0; j < count; ++j) {
+            kill_(g_stop_pids[j], 9);
+            kill_(-g_stop_pids[j], 9);
+        }
+        if (helper > 1) { kill_(helper, 9); kill_(-helper, 9); }
+        sleep_ms(100);
+    }
+    for (i = 0; i < 20; ++i) {
+        reap_usb();
+        if (!live_pids(count)) break;
+        sleep_ms(50);
+    }
+    reap_usb();
+    live = log_survivors(count);
+    if (live) kmsg("CINIT: continuing root handoff despite unreaped early children\n");
+    else kmsg("CINIT: early USB descendants stopped and reaped\n");
+    g_usb_pid = 0;
+    return 0;
+}
+
+'''
+
+
+def fix_handoff(text):
+    """Replace the aborting stop_early_usb with the non-fatal handoff version."""
+    if "early child survived pid=" in text:
+        return text
+    start = text.find("static int live_pids(int count)\n{")
+    end = text.find("static const char *const OLD_MOUNTS[] = {")
+    if start < 0 or end < start:
+        return text
+    return text[:start] + NEW_HANDOFF + text[end:]
+
+
 s = SOURCE.read_text()
 if "/* PEARL USB CINIT integration */" in s:
-    print(f"already patched: {SOURCE}")
+    fixed = s.replace("#define O_DIRECTORY 0x10000", "#define O_DIRECTORY 0x4000")
+    if "#define O_NOFOLLOW " not in fixed:
+        fixed = fixed.replace("#define O_DIRECTORY 0x4000", "#define O_DIRECTORY 0x4000\n#define O_NOFOLLOW 0x8000", 1)
+    fixed = fixed.replace("O_RDWR | O_CLOEXEC | 0x20000", "O_RDWR | O_CLOEXEC | O_NOFOLLOW")
+    fixed = fix_handoff(fixed)
+    tmp_fixed = fixed.replace('mount_("tmpfs", "/newroot/tmp", "tmpfs", MS_NOSUID | MS_NOEXEC, 0)', 'mount_("tmpfs", "/newroot/tmp", "tmpfs", MS_NOSUID, 0)')
+    if tmp_fixed != fixed:
+        tmp_backup = SOURCE.with_name("init.c.before-tmp-exec")
+        if not tmp_backup.exists():
+            tmp_backup.write_bytes(SOURCE.read_bytes())
+        fixed = tmp_fixed
+    run_fixed = fixed.replace('mount_("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755")', 'mount_("tmpfs", "/run", "tmpfs", MS_NOSUID, "mode=0755")')
+    if run_fixed != fixed:
+        run_backup = SOURCE.with_name("init.c.before-run-exec")
+        if not run_backup.exists():
+            run_backup.write_bytes(SOURCE.read_bytes())
+        fixed = run_fixed
+    if fixed != s:
+        abi_backup = SOURCE.with_name("init.c.before-arm64-open-flags")
+        if not abi_backup.exists():
+            abi_backup.write_bytes(SOURCE.read_bytes())
+        handoff_backup = SOURCE.with_name("init.c.before-handoff-fix")
+        if not handoff_backup.exists():
+            handoff_backup.write_bytes(SOURCE.read_bytes())
+        SOURCE.write_text(fixed)
+        print(f"updated AArch64 open flags, non-fatal root handoff and /tmp + /run exec: {SOURCE}")
+    else:
+        print(f"already patched: {SOURCE}")
     raise SystemExit(0)
 backup = SOURCE.with_name("init.c.original")
 if not backup.exists():
     backup.write_bytes(SOURCE.read_bytes())
 s = s.replace("getdents64=217", "getdents64=61")
 s = s.replace("ksys(217, fd,", "ksys(61, fd,")
-s = s.replace("#define O_NONBLOCK 0x800", "#define O_NONBLOCK 0x800\n#define O_RDWR 2\n#define O_DIRECTORY 0x10000\n#define O_CLOEXEC 0x80000\n#define MS_REC 0x4000\n#define MS_PRIVATE 0x40000")
+# Linux AArch64 asm/fcntl.h values; 0x10000 is O_DIRECT, not O_DIRECTORY.
+s = s.replace("#define O_NONBLOCK 0x800", "#define O_NONBLOCK 0x800\n#define O_RDWR 2\n#define O_DIRECTORY 0x4000\n#define O_NOFOLLOW 0x8000\n#define O_CLOEXEC 0x80000\n#define MS_REC 0x4000\n#define MS_PRIVATE 0x40000")
 s = s.replace("static long strlen_(const char *s)", r"""/* AArch64 clone(SIGCHLD) is fork-like: no shared memory and no child stack. */
 static long clone_(void) { return ksys(220, 17, 0, 0, 0, 0); }
 static long kill_(long pid, long sig) { return ksys(129, pid, sig, 0, 0, 0); }
@@ -295,7 +435,7 @@ static void boot_rootfs(void)
     mkdir_p("/newroot/dev");
     mkdir_p("/newroot/tmp");
     mkdir_p("/newroot/var/log/pearl-usb");
-    rc = mount_("tmpfs", "/newroot/tmp", "tmpfs", MS_NOSUID | MS_NOEXEC, 0);
+    rc = mount_("tmpfs", "/newroot/tmp", "tmpfs", MS_NOSUID, 0);
     result_("mount root tmp", rc);
     if (rc != 0) rescue_loop(0);
     rc = mount_(0, "/", 0, MS_REC | MS_PRIVATE, 0);
@@ -310,6 +450,7 @@ static void boot_rootfs(void)
         if (new_root_fd >= 0) close_(new_root_fd);
         rescue_loop(0);
     }
+    result_("open root directory handles", 0);
     if (stop_early_usb()) { close_(old_root_fd); close_(new_root_fd); rescue_loop(0); }
     rc = copy_file("/pearl-early.log", "/newroot/var/log/pearl-usb/initramfs.log");
     result_("save initramfs log after helper shutdown", rc);
@@ -399,7 +540,7 @@ void _start(void)
     sys_rc = mount_("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC, 0);
     result_("mount early sysfs", sys_rc);
     mkdirat(AT_FDCWD, "/run", 0755);
-    run_rc = mount_("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755");
+    run_rc = mount_("tmpfs", "/run", "tmpfs", MS_NOSUID, "mode=0755");
     result_("mount early run", run_rc);
     mkdirat(AT_FDCWD, "/dev/pts", 0755);
     pts_rc = mount_("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,ptmxmode=0666");
@@ -412,5 +553,6 @@ void _start(void)
     rescue_loop(0);
 }
 """
+s = fix_handoff(s)
 SOURCE.write_text(s)
 print(f"patched {SOURCE}: {len(s.encode())} bytes; original retained at {backup}")
