@@ -2,18 +2,20 @@
 
 Redmi Note 12T Pro（Pearl / MT6895）的内核构建与启动镜像项目。
 
-**当前方案：最新 Pearl 分支源码 + 本仓库配置 + Ubuntu 默认 Clang/LLVM，同次构建官方 Xaga initramfs。** 历史产物的版本、大小、hash、Android 头字段和工具链版本，不作为新构建的固定前提。
+**当前方案：最新 Pearl 分支源码 + 本仓库配置 + Ubuntu 默认 Clang/LLVM，同次构建官方 Xaga initramfs 并封装 boot/vendor_boot。** 历史产物的版本、大小、hash、Android 头字段和工具链版本，不作为新构建的固定前提。
 
 项目的试错、rootfs 尝试和方案变化放在 [hittory.md](hittory.md)，本页只说明现在怎么使用。
 
 ## 1. 构建内核
 
-打开 [Actions → Build Pearl kernel, initramfs and release](https://github.com/cailuoli520/pearl-mainline/actions/workflows/build-kernel.yml)，点击 **Run workflow**。
+打开 [Actions → Build Pearl kernel, initramfs, boot images and release](https://github.com/cailuoli520/pearl-mainline/actions/workflows/build-kernel.yml)，点击 **Run workflow**。
 
 修改并提交以下内容到 `main` 也会触发构建：
 
 - [configs/pearl.config](configs/pearl.config)：实际使用的内核配置。
 - [scripts/build-kernel.sh](scripts/build-kernel.sh)：构建脚本。
+- [scripts/pack-boot.py](scripts/pack-boot.py)：按 stock 模板封装启动镜像。
+- [stock](stock)：原厂 boot/vendor_boot 模板。
 - [build-kernel.yml](.github/workflows/build-kernel.yml)：Actions 工作流。
 
 | 项目 | 当前做法 |
@@ -24,6 +26,7 @@ Redmi Note 12T Pro（Pearl / MT6895）的内核构建与启动镜像项目。
 | Runner | GitHub 托管 `ubuntu-26.04-arm`，原生 ARM64 |
 | 工具链 | Ubuntu 默认无版本号 `clang llvm lld`，不固定 Clang 版本 |
 | 编译 | `-j4`，先构建官方 initramfs，再在独立 in-tree 目录构建 Pearl 内核、DTB 和同次模块 |
+| 镜像封装 | 使用 AOSP mkbootimg/avbtool，从 stock 读取参数，封装同次载荷为 boot/vendor_boot |
 | 发布 | 构建与打包成功后自动创建 GitHub Release |
 | 错误处理 | `set -euo pipefail`，任一步失败立即停止并保留日志 |
 
@@ -49,6 +52,8 @@ Release 包含：
 Image
 Image.gz
 initramfs.cpio.lz4
+boot.img
+vendor_boot.img
 pearl.dtb
 modules-<release>.tar.zst
 kernel.config
@@ -76,23 +81,25 @@ build-info.txt
 
 ## 4. boot 与 vendor_boot 封装
 
-**当前 Actions 已同次构建并发布官方 Xaga initramfs，但尚未自动生成 boot/vendor_boot 或 rootfs。** boot/vendor_boot 目前在编译机另行封装，现有镜像不会被本次构建改写。
+**Actions 在内核和 initramfs 构建完成后，自动封装 boot.img 与 vendor_boot.img，并与其他同次产物一起发布。** rootfs 仍独立制作，stock 原件和手机现有镜像不会被改写。
 
 封装使用：
 
 ```text
-同次 Release 的 Image.gz
-+ 已有 Pearl Linux initramfs
+本次构建的 Image.gz
++ 本次官方 Xaga initramfs.cpio.lz4
 + stock 原厂模板
 → boot.img / vendor_boot.img
 ```
 
 - **boot**：从原厂头部取得参数，替换为本次内核和 Linux initramfs。
-- **vendor_boot**：沿用原厂完整 DTB 容器、地址、cmdline、bootconfig 和 ramdisk 表，只替换 Linux ramdisk，并由打包工具维护长度与对齐。
+- **vendor_boot**：沿用原厂完整 DTB 容器、地址、cmdline、bootconfig 和 ramdisk 表，用同一份 initramfs 替换平台片段，保留片段的 type/name/board ID。其他 recovery/DLKM 片段如存在则保持原载荷；长度、偏移与对齐由官方打包工具维护。
 - **设备树**：内核构建的 Pearl DTB 与 vendor_boot 的原厂 DTB 区是两件事，不把 Linux DTB 直接当成原厂模板替换。
 - **AVB**：生成 Linux 镜像时使用 `NONE` hash footer；三个 vbmeta 的禁用副本单独处理。生成 footer 是封装步骤，不追加验收流程，也不是 OEM 重新签名。
 
-Android 版本、补丁日期、地址、盐和分区容量从对应 stock 模板取值，不再照抄旧样本的硬编码参数。
+Android 版本、补丁日期、地址、盐、props、rollback 与逻辑分区容量分别从对应 stock 模板取值，不再照抄旧样本的硬编码参数。新镜像正常重算 hash/footer，不复用原镜像的 digest、签名或旧载荷长度。原厂 GKI 签名只对应原厂载荷；本流程不提供 GKI 重签参数，新无签名 Linux boot v4 的签名长度由 mkbootimg 正常生成 0。
+
+[pack-boot.py](scripts/pack-boot.py) 使用 AOSP 参数导出列表调用 mkbootimg，再调用 avbtool；任何正常构建或封装命令失败就停止。只处理输入模板，不追加输出二次解包、hash 对比、ELF 扫描或刷机步骤。
 
 ### initramfs 来源
 
@@ -100,13 +107,13 @@ Actions 每次从 [官方 initramfs 仓库的 `xaga-mt6895` 分支](https://gith
 
 内核和 initramfs 各自的实际 commit 记录在同一 Release 的 `build-info.txt`。该 initramfs 保留上游 Xaga 的分区、固件和启动默认行为；**构建成功不等于已经在 Pearl 实机验证**，本流程不刷写手机。
 
-**使用边界：当前上游启动代码会尝试清零 EXPDB 分区的前 4 字节，默认路径为 `/dev/sdc11`。这里原样保留该行为，不改写 Pearl 的分区映射，也不把此产物当作已经适配 Pearl 的可刷启动镜像。**
+**使用边界：当前上游启动代码会尝试清零 EXPDB 分区的前 4 字节，默认路径为 `/dev/sdc11`。这里原样保留该行为，不改写 Pearl 的分区映射，生成 Android 格式的 boot/vendor_boot 不代表已完成 Pearl 实机适配。**
 
 此前手工封装 boot/vendor_boot 使用的 Pearl 定制 CINIT ramdisk 是另一套输入，其 `/etc/mt6895-rootfs` 识别和双 USB 行为不会被本次代码改动替换。
 
 ## 5. rootfs
 
-本仓库当前自动流程负责内核、DTB、模块和官方 Xaga initramfs；rootfs 仍独立制作并放入设备根分区。
+本仓库当前自动流程负责内核、DTB、模块、官方 Xaga initramfs 和 boot/vendor_boot 封装；rootfs 仍独立制作并放入设备根分区。
 
 ### Pearl rootfs skill
 

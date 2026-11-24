@@ -1,5 +1,5 @@
-name: Build Pearl kernel, initramfs and release
-run-name: Pearl kernel + initramfs · build ${{ github.run_number }}
+name: Build Pearl kernel, initramfs, boot images and release
+run-name: Pearl kernel + boot images · build ${{ github.run_number }}
 
 on:
   workflow_dispatch:
@@ -9,6 +9,7 @@ on:
       - '.github/workflows/build-kernel.yml'
       - 'configs/**'
       - 'scripts/**'
+      - 'stock/**'
       - '.gitattributes'
 
 permissions:
@@ -37,7 +38,7 @@ jobs:
             libssl-dev libelf-dev zlib1g-dev openssl git python3 \
             xz-utils zstd kmod rsync file gzip cpio lz4
 
-      - name: Build latest Pearl kernel, same-build modules and official Xaga initramfs
+      - name: Build Pearl kernel, modules, Xaga initramfs and packaged boot images
         id: build
         shell: bash
         run: |

@@ -5,6 +5,8 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 JOBS=${BUILD_JOBS:-4}
 SOURCE="$ROOT/.work/linux"
 INITRAMFS_SOURCE="$ROOT/.work/initramfs"
+MKBOOTIMG_SOURCE="$ROOT/.work/mkbootimg"
+AVB_SOURCE="$ROOT/.work/avb"
 STAGING="$ROOT/.work/modules"
 OUT="$ROOT/out"
 
@@ -45,12 +47,23 @@ cp .config "$OUT/kernel.config"
 cp include/config/kernel.release System.map Module.symvers "$OUT/"
 tar --numeric-owner --owner=0 --group=0 -C "$STAGING/lib/modules" -cf - "$RELEASE" \
   | zstd -T"$JOBS" -10 --no-progress -o "$OUT/modules-$RELEASE.tar.zst"
+
+# Stock templates supply all header and AVB parameters; never modify the originals.
+git clone --depth=1 --single-branch \
+  https://android.googlesource.com/platform/system/tools/mkbootimg "$MKBOOTIMG_SOURCE"
+git clone --depth=1 --single-branch \
+  https://android.googlesource.com/platform/external/avb "$AVB_SOURCE"
+python3 "$ROOT/scripts/pack-boot.py" \
+  --mkbootimg-dir "$MKBOOTIMG_SOURCE" --avbtool-dir "$AVB_SOURCE"
+
 {
   printf 'Kernel: %s\nKernel commit: %s\n' "$RELEASE" "$COMMIT"
   printf 'Source: MT6895-Mainline/linux branch 7.2-mt6895-xiaomi-pearl\n'
   printf 'Initramfs source: MT6895-Mainline/initramfs branch xaga-mt6895\n'
   printf 'Initramfs commit: %s\n' "$INITRAMFS_COMMIT"
   printf 'Initramfs: official newc cpio + legacy LZ4; no source patches\n'
+  printf 'Boot images: stock templates + same-build Image.gz/initramfs; AVB NONE footer\n'
+  printf 'Packaging tools: AOSP mkbootimg and avbtool; no extra artifact verification\n'
   printf 'Config: this repository configs/pearl.config\n'
   printf 'Runner: Ubuntu 26.04 ARM64; default Ubuntu clang/LLVM\n'
   clang --version
