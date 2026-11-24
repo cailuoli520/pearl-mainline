@@ -4,12 +4,22 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 JOBS=${BUILD_JOBS:-4}
 SOURCE="$ROOT/.work/linux"
+INITRAMFS_SOURCE="$ROOT/.work/initramfs"
 STAGING="$ROOT/.work/modules"
 OUT="$ROOT/out"
 
 export PATH="/usr/bin:/bin:$PATH"
 export ARCH=arm64 LLVM=1 LLVM_IAS=1 LOCALVERSION=''
 mkdir -p "$ROOT/.work" "$OUT"
+
+# Build the official Xaga ramdisk without local patches.
+git clone --depth=1 --single-branch --branch xaga-mt6895 \
+  https://github.com/MT6895-Mainline/initramfs.git "$INITRAMFS_SOURCE"
+INITRAMFS_COMMIT=$(git -C "$INITRAMFS_SOURCE" rev-parse HEAD)
+make -C "$INITRAMFS_SOURCE" clean
+make -C "$INITRAMFS_SOURCE" -j"$JOBS" CC="clang --target=aarch64-linux-gnu -fuse-ld=lld"
+cp "$INITRAMFS_SOURCE/initramfs.cpio.lz4" "$OUT/"
+
 git clone --depth=1 --single-branch --branch 7.2-mt6895-xiaomi-pearl \
   https://github.com/MT6895-Mainline/linux.git "$SOURCE"
 COMMIT=$(git -C "$SOURCE" rev-parse HEAD)
@@ -38,6 +48,9 @@ tar --numeric-owner --owner=0 --group=0 -C "$STAGING/lib/modules" -cf - "$RELEAS
 {
   printf 'Kernel: %s\nKernel commit: %s\n' "$RELEASE" "$COMMIT"
   printf 'Source: MT6895-Mainline/linux branch 7.2-mt6895-xiaomi-pearl\n'
+  printf 'Initramfs source: MT6895-Mainline/initramfs branch xaga-mt6895\n'
+  printf 'Initramfs commit: %s\n' "$INITRAMFS_COMMIT"
+  printf 'Initramfs: official newc cpio + legacy LZ4; no source patches\n'
   printf 'Config: this repository configs/pearl.config\n'
   printf 'Runner: Ubuntu 26.04 ARM64; default Ubuntu clang/LLVM\n'
   clang --version

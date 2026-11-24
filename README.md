@@ -2,13 +2,13 @@
 
 Redmi Note 12T Pro（Pearl / MT6895）的内核构建与启动镜像项目。
 
-**当前方案：最新 Pearl 分支源码 + 本仓库配置 + Ubuntu 默认 Clang/LLVM。** 历史产物的版本、大小、hash、Android 头字段和工具链版本，不作为新构建的固定前提。
+**当前方案：最新 Pearl 分支源码 + 本仓库配置 + Ubuntu 默认 Clang/LLVM，同次构建官方 Xaga initramfs。** 历史产物的版本、大小、hash、Android 头字段和工具链版本，不作为新构建的固定前提。
 
 项目的试错、rootfs 尝试和方案变化放在 [hittory.md](hittory.md)，本页只说明现在怎么使用。
 
 ## 1. 构建内核
 
-打开 [Actions → Build Pearl kernel and release](https://github.com/cailuoli520/pearl-mainline/actions/workflows/build-kernel.yml)，点击 **Run workflow**。
+打开 [Actions → Build Pearl kernel, initramfs and release](https://github.com/cailuoli520/pearl-mainline/actions/workflows/build-kernel.yml)，点击 **Run workflow**。
 
 修改并提交以下内容到 `main` 也会触发构建：
 
@@ -19,10 +19,11 @@ Redmi Note 12T Pro（Pearl / MT6895）的内核构建与启动镜像项目。
 | 项目 | 当前做法 |
 |---|---|
 | 源码 | 每次浅克隆 [MT6895-Mainline/linux 的 Pearl 分支](https://github.com/MT6895-Mainline/linux/tree/7.2-mt6895-xiaomi-pearl)最新 HEAD，不锁定某个内核 commit |
+| initramfs | 每次浅克隆 [MT6895-Mainline/initramfs 的 xaga-mt6895 分支](https://github.com/MT6895-Mainline/initramfs/tree/xaga-mt6895)最新 HEAD，使用官方 Makefile，不附加本地补丁 |
 | 配置 | 只复制本仓库配置；Magma 是初始来源，运行时不再下载覆盖 |
 | Runner | GitHub 托管 `ubuntu-26.04-arm`，原生 ARM64 |
 | 工具链 | Ubuntu 默认无版本号 `clang llvm lld`，不固定 Clang 版本 |
-| 编译 | 独立 in-tree 目录，`-j4`，同次构建内核、DTB 和模块 |
+| 编译 | `-j4`，先构建官方 initramfs，再在独立 in-tree 目录构建 Pearl 内核、DTB 和同次模块 |
 | 发布 | 构建与打包成功后自动创建 GitHub Release |
 | 错误处理 | `set -euo pipefail`，任一步失败立即停止并保留日志 |
 
@@ -47,6 +48,7 @@ Release 包含：
 ```text
 Image
 Image.gz
+initramfs.cpio.lz4
 pearl.dtb
 modules-<release>.tar.zst
 kernel.config
@@ -74,7 +76,7 @@ build-info.txt
 
 ## 4. boot 与 vendor_boot 封装
 
-**当前内核 Actions 尚未自动生成 initramfs、boot/vendor_boot 或 rootfs。** boot/vendor_boot 目前在编译机另行封装。
+**当前 Actions 已同次构建并发布官方 Xaga initramfs，但尚未自动生成 boot/vendor_boot 或 rootfs。** boot/vendor_boot 目前在编译机另行封装，现有镜像不会被本次构建改写。
 
 封装使用：
 
@@ -94,13 +96,17 @@ Android 版本、补丁日期、地址、盐和分区容量从对应 stock 模�
 
 ### initramfs 来源
 
-当前复用的是此前为 Pearl 手工制作的 Linux 启动 ramdisk，格式为 **newc cpio + legacy LZ4**，其中的静态 AArch64 `/init` 在日志中显示为 **CINIT**。
+Actions 每次从 [官方 initramfs 仓库的 `xaga-mt6895` 分支](https://github.com/MT6895-Mainline/initramfs/tree/xaga-mt6895)克隆最新源码，执行上游 `make clean` 和 `make`，生成 **newc cpio + legacy LZ4** 格式的 `initramfs.cpio.lz4`。编译复用现有 Ubuntu Clang/LLD，通过 Makefile 的 `CC` 参数指定 AArch64 目标；不套用历史 Pearl CINIT/双 USB 补丁。
 
-它负责寻找并挂载带有 `/etc/mt6895-rootfs` 标记的根文件系统，随后执行 `switch_root → /sbin/init`。它不是内核 `make` 生成的，也不是 Nura/xaga 的官方 initramfs；目前仍是手工封装时另行提供的输入。
+内核和 initramfs 各自的实际 commit 记录在同一 Release 的 `build-info.txt`。该 initramfs 保留上游 Xaga 的分区、固件和启动默认行为；**构建成功不等于已经在 Pearl 实机验证**，本流程不刷写手机。
+
+**使用边界：当前上游启动代码会尝试清零 EXPDB 分区的前 4 字节，默认路径为 `/dev/sdc11`。这里原样保留该行为，不改写 Pearl 的分区映射，也不把此产物当作已经适配 Pearl 的可刷启动镜像。**
+
+此前手工封装 boot/vendor_boot 使用的 Pearl 定制 CINIT ramdisk 是另一套输入，其 `/etc/mt6895-rootfs` 识别和双 USB 行为不会被本次代码改动替换。
 
 ## 5. rootfs
 
-本仓库当前自动流程只负责内核、DTB 和模块，rootfs 独立制作并放入设备根分区。
+本仓库当前自动流程负责内核、DTB、模块和官方 Xaga initramfs；rootfs 仍独立制作并放入设备根分区。
 
 ### Pearl rootfs skill
 
